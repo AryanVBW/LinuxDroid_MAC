@@ -46,21 +46,66 @@ This comprehensive guide covers recovery and troubleshooting for various issues 
 
 ## If Kali Linux Doesn't Appear in Boot Options
 
-1. **Check Security Settings**:
-   - Boot into Recovery Mode (hold power button until "Loading startup options" appears)
-   - Select "Options"
-   - Go to Utilities → Startup Security Utility
-   - Ensure "Security Policy" is set to "Reduced Security"
+### Using Recovery Mode to Boot Kali When It's Not Showing as a Startup Disk
+
+1. **Access Recovery Mode**:
+   - Turn off your Mac completely
+   - Press and hold the power button until "Loading startup options" appears
+   - Select "Options" to enter Recovery Mode
+
+2. **Use Terminal to Find and Boot Kali**:
+   - In Recovery Mode, select "Utilities" from the top menu
+   - Open "Terminal"
+   - Run the following commands to identify your Kali partition:
+     ```bash
+     diskutil list
+     ```
+   - Look for your Kali partition (usually labeled as Linux or KALI)
+   - Once you've identified the disk identifier (e.g., disk0s4), try to directly boot from it:
+     ```bash
+     # First check if it contains bootable files
+     ls -la /dev/disk0s4
+     
+     # Try to boot directly from this partition
+     bless --device /dev/disk0s4 --setBoot
+     reboot
+     ```
+
+3. **If Direct Boot Doesn't Work, Try Setting Boot Priority**:
+   ```bash
+   # Try to set boot priority for Kali
+   bless --mount /dev/disk0s4 --setBoot
+   # Or try with mount point if the disk can be mounted
+   diskutil mount /dev/disk0s4
+   bless --mount /Volumes/KALI --setBoot
+   ```
+
+4. **Manual Boot Option Using nvram**:
+   ```bash
+   # Find the GUID of your Kali partition
+   diskutil info /dev/disk0s4 | grep "Volume UUID"
+   
+   # Set this as your boot disk using nvram
+   sudo nvram boot-volume="GUID_FROM_ABOVE"
+   sudo nvram boot-args="-v"
+   reboot
+   ```
+
+5. **Security Settings Check**:
+   - While in Recovery Mode, select "Utilities" from the menu bar
+   - Choose "Startup Security Utility"
+   - You may need to authenticate with your password
+   - Set Security Policy to "Reduced Security"
    - Enable "Allow booting from external media"
 
-2. **Reinstall rEFInd Bootloader**:
+6. **Reinstall rEFInd Bootloader**:
    - Boot into macOS
    - Download rEFInd from https://sourceforge.net/projects/refind/
    - Open Terminal
    - Extract rEFInd: `unzip -d ~/refind refind-bin-*.zip`
    - Run the installation script: `cd ~/refind/refind-bin-* && ./refind-install`
 
-3. **Check Partition Format**:
+7. **Check Partition Format**:
    - In Terminal, run: `diskutil list` 
    - Verify the Kali partition exists and is properly formatted
 

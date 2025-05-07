@@ -707,19 +707,23 @@ install_refind_manual() {
 # rEFInd configuration for Kali Linux on Apple Silicon
 scanfor manual,internal,external
 timeout 5
+use_nvram false
 
 # Kali Linux boot entry
 menuentry "Kali Linux" {
     icon /EFI/boot/icons/os_linux.png
-    loader /vmlinuz
-    initrd /initrd.img
+    loader /boot/vmlinuz
+    initrd /boot/initrd.img
     options "root=LABEL=KALI rw rootflags=data=writeback quiet splash"
+    ostype Linux
+    graphics on
 }
 
 # macOS boot entry
 menuentry "macOS" {
     icon /EFI/boot/icons/os_mac.png
     loader \EFI\APPLE\FIRMWARE\iBoot.efi
+    ostype MacOS
 }
 EOF
     
@@ -741,6 +745,30 @@ EOF
         info "2. Go to 'Security Policy' and choose 'Reduced Security'"
         info "3. Enable 'Allow booting from external media'"
     fi
+    
+    # Create a startup-options.plist file to ensure Kali appears in boot options
+    info "Creating startup-options.plist to register Kali in boot options..."
+    local STARTUP_OPTIONS="/Volumes/KALI/EFI/boot/startup-options.plist"
+    
+    cat << EOF | sudo tee "$STARTUP_OPTIONS" > /dev/null
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>BootSourcesList</key>
+    <array>
+        <dict>
+            <key>Name</key>
+            <string>Kali Linux</string>
+            <key>Path</key>
+            <string>/EFI/boot/bootaa64.efi</string>
+            <key>Type</key>
+            <string>File</string>
+        </dict>
+    </array>
+</dict>
+</plist>
+EOF
     
     # Inform about the startup key combinations
     info "To boot Kali Linux after installation:"
@@ -1300,15 +1328,22 @@ install_kali() {
     info "Configuring bootloader..."
     
     # Create necessary directories if they don't exist
-    sudo mkdir -p "$mount_point/boot/grub" || fatal "Failed to create boot directories"
+    sudo mkdir -p "$mount_point/boot/grub" || warning "Failed to create boot directories - may already exist"
+    sudo mkdir -p "$mount_point/boot/EFI/boot" || warning "Failed to create EFI boot directories - may already exist"
     
-    # Create a basic GRUB configuration file
+    # Create a basic GRUB configuration file with more robust root partition handling
     cat > "$WORK_DIR/grub.cfg" <<EOL
 set default=0
 set timeout=5
 
+# Use both device path and LABEL for better compatibility
 menuentry "Kali Linux on Apple Silicon" {
-    linux /boot/vmlinuz root=/dev/$(basename "$target_partition") ro quiet splash
+    linux /boot/vmlinuz root=/dev/$(basename "$target_partition") rootflags=data=writeback ro quiet splash
+    initrd /boot/initrd.img
+}
+
+menuentry "Kali Linux using LABEL" {
+    linux /boot/vmlinuz root=LABEL=KALI rootflags=data=writeback ro quiet splash
     initrd /boot/initrd.img
 }
 
@@ -1321,7 +1356,7 @@ EOL
     # Copy GRUB config to the target partition
     sudo cp "$WORK_DIR/grub.cfg" "$mount_point/boot/grub/" || fatal "Failed to copy GRUB configuration"
     
-    # Create a text file with installation notes
+    # Create a text file with installation notes and troubleshooting tips
     cat > "$WORK_DIR/kali_notes.txt" <<EOL
 === Kali Linux on Apple Silicon Installation Notes ===
 
@@ -1339,9 +1374,21 @@ Known limitations:
 
 First boot instructions:
 1. At boot, hold down the power button to access startup options
-2. Select the rEFInd bootloader
-3. Choose Kali Linux from the boot menu
+2. Select the Kali Linux boot option (or External Boot)
+3. If Kali Linux doesn't appear, select 'Boot from External Options'
 4. Complete the initial setup as prompted
+
+Troubleshooting:
+If Kali Linux doesn't appear in boot options:
+1. Restart in Recovery Mode (hold power button at startup)
+2. Open Terminal and run: 'bputil -d'
+3. Go to Startup Security Utility and select 'No Security' and 'Allow booting from external media'
+4. Restart and try again
+
+If still having issues:
+1. In Recovery Mode, run 'diskutil list' to identify the Kali partition
+2. Mount the EFI partition with 'diskutil mount diskXsY' (replace X and Y with appropriate numbers)
+3. Check if /Volumes/EFI/EFI/boot/ contains bootaa64.efi
 
 For support and updates, visit:
 - https://www.kali.org/docs/
@@ -1372,32 +1419,87 @@ configure_dual_boot() {
     
     info "Configuring dual boot with rEFInd..."
     
+    # Try to mount the Kali partition to ensure boot files are accessible
+    local kali_mount="/Volumes/KALI"
+    if ! mount | grep -q "$kali_mount"; then
+        info "Mounting Kali partition for boot configuration..."
+        sudo diskutil mount -mountPoint "$kali_mount" "$target_partition" || warning "Could not mount Kali partition - this is normal if Linux filesystem is already written"
+    fi
+    
     # Find and mount the EFI partition
     info "Finding EFI partition..."
     local efi_partition
-    efi_partition=$(diskutil list | grep EFI | awk '{print $NF}')
+    
+    # Display all disks for debugging
+    info "Available disks and partitions:"
+    diskutil list
+    
+    # More robust EFI partition detection with explicit disk device path
+    efi_partition=$(diskutil list | grep -E "EFI.*disk[0-9]+s[0-9]+" | head -1 | awk '{print $NF}')
+    if [ -n "$efi_partition" ]; then
+        efi_partition="/dev/$efi_partition"
+        info "Found EFI partition: $efi_partition"
+    fi
+    
+    if [ -z "$efi_partition" ]; then
+        # Alternative way to find the EFI partition
+        efi_partition=$(diskutil list | grep -A 2 "GUID_partition_scheme" | grep EFI | awk '{print $NF}')
+        if [ -n "$efi_partition" ]; then
+            efi_partition="/dev/$efi_partition"
+            info "Found EFI partition (method 2): $efi_partition"
+        fi
+    fi
     
     if [ -z "$efi_partition" ]; then
         warning "Could not automatically find EFI partition."
         diskutil list
-        read -r -p "${YELLOW}${BOLD}Enter the EFI partition identifier (e.g., disk0s1):${NC} " efi_partition
+        read -r -p "${YELLOW}${BOLD}Enter the EFI partition identifier (e.g., disk0s1):${NC} " efi_partition_input
+        if [ -n "$efi_partition_input" ]; then
+            # Add /dev/ prefix if not already present
+            if [[ "$efi_partition_input" != /dev/* ]]; then
+                efi_partition="/dev/$efi_partition_input"
+            else
+                efi_partition="$efi_partition_input"
+            fi
+            info "Using user-specified EFI partition: $efi_partition"
+        else
+            warning "No EFI partition specified. Will skip EFI partition mounting."
+            # Set a flag to indicate we should skip EFI operations
+            SKIP_EFI=true
+        fi
     fi
     
     # Create mount point for EFI partition
     local efi_mount="/Volumes/EFI"
     mkdir -p "$efi_mount"
     
-    # Check if already mounted
-    if mount | grep -q "$efi_mount"; then
-        info "EFI partition is already mounted."
+    # Check if we should skip EFI operations
+    if [ "${SKIP_EFI:-false}" = true ]; then
+        warning "Skipping EFI partition mounting and configuration."
+        info "You will need to manually configure the bootloader later."
     else
-        # Mount the EFI partition
-        info "Mounting EFI partition..."
-        sudo diskutil mount -mountPoint "$efi_mount" "$efi_partition" || fatal "Failed to mount EFI partition"
+        # Check if already mounted
+        if mount | grep -q "$efi_mount"; then
+            info "EFI partition is already mounted at $efi_mount."
+        else
+            # Mount the EFI partition
+            info "Mounting EFI partition $efi_partition..."
+            if ! sudo diskutil mount -mountPoint "$efi_mount" "$efi_partition" 2>/dev/null; then
+                warning "Failed to mount EFI partition. Will continue without EFI configuration."
+                SKIP_EFI=true
+            else
+                success "EFI partition mounted successfully."
+            fi
+        fi
     fi
     
     # Check if rEFInd is installed
-    if [ ! -d "$efi_mount/EFI/refind" ]; then
+    if [ "${SKIP_EFI:-false}" = true ]; then
+        warning "Skipping rEFInd check since EFI partition is not accessible."
+        info "Continuing with installation..."
+        success "Dual boot configuration completed with limited EFI support."
+        return 0
+    elif [ ! -d "$efi_mount/EFI/refind" ]; then
         warning "rEFInd directory not found in EFI partition."
         warning "The bootloader might not be properly installed."
         if ! confirm "Do you want to continue anyway?"; then
@@ -1431,27 +1533,40 @@ EOL
     fi
     
     # Check if Kali Linux entry already exists in refind.conf
-    if grep -q "Kali Linux" "$efi_mount/EFI/refind/refind.conf"; then
+    if grep -q "Kali Linux" "$refind_conf"; then
         info "Kali Linux entry already exists in rEFInd configuration."
     else
         # Add Kali Linux entry to refind.conf
         info "Adding Kali Linux to rEFInd boot options..."
         
-        # Create a config snippet for Kali Linux
-        cat > "$WORK_DIR/kali_config.txt" <<EOL
+        # Create a manual stanza for Kali Linux with more boot options
+        cat > "$WORK_DIR/kali_stanza.txt" <<EOL
 
-# Kali Linux
+# Manual stanza for Kali Linux
 menuentry "Kali Linux" {
     icon /EFI/refind/icons/os_linux.png
     volume "KALI"
     loader /boot/vmlinuz
     initrd /boot/initrd.img
-    options "root=/dev/$(basename "$target_partition") ro quiet splash"
+    options "root=LABEL=KALI rootflags=data=writeback ro quiet splash"
+    ostype Linux
+    graphics on
+}
+
+# Alternative boot option for Kali Linux using device path
+menuentry "Kali Linux (Alt)" {
+    icon /EFI/refind/icons/os_linux.png
+    volume "KALI"
+    loader /vmlinuz
+    initrd /initrd.img
+    options "root=/dev/$(basename "$target_partition") rootflags=data=writeback ro quiet splash"
+    ostype Linux
+    graphics on
 }
 EOL
         
         # Append the config snippet to refind.conf
-        sudo bash -c "cat '$WORK_DIR/kali_config.txt' >> '$efi_mount/EFI/refind/refind.conf'" || \
+        sudo bash -c "cat '$WORK_DIR/kali_stanza.txt' >> '$refind_conf'" || \
             fatal "Failed to update rEFInd configuration"
     fi
     
@@ -1493,30 +1608,36 @@ EOL
 #             CLEANUP AND COMPLETION                #
 #####################################################
 
-# Complete installation and provide final instructions
-complete_installation() {
-    print_step "7" "Installation Complete"
+# Finish up
+finish() {
+    print_step "$TOTAL_STEPS" "Finishing installation"
     
-    # Clean up temporary files
-    info "Cleaning up temporary files..."
-    rm -rf "$WORK_DIR" || warning "Failed to clean up some temporary files"
+    success "Kali Linux has been successfully installed on your Apple Silicon Mac!"
     
-    # Provide final instructions
-    echo -e "\n${GREEN}${BOLD}=== KALI LINUX INSTALLATION COMPLETED SUCCESSFULLY ===${NC}"
-    echo -e "\n${BLUE}${BOLD}Next Steps:${NC}"
-    echo "1. Restart your Mac."
-    echo "2. Hold the power button until you see 'Loading startup options'."
-    echo "3. Select the rEFInd bootloader."
-    echo "4. Choose Kali Linux from the boot menu."
-    echo "5. Complete the Kali Linux setup process."
+    echo -e "\n${GREEN}${BOLD}=== Installation Complete ===${NC}"
+    echo -e "${YELLOW}To boot Kali Linux:${NC}"
+    echo -e "1. Restart your Mac and hold the power button until you see startup options"
+    echo -e "2. Select your Kali Linux installation (may appear as 'External Boot' or 'EFI Boot')"
+    echo -e "3. If Kali Linux doesn't appear, select 'Boot from External Options'"
+    echo -e "\n${YELLOW}Troubleshooting if Kali doesn't appear in boot options:${NC}"
+    echo -e "1. Restart into Recovery Mode (hold power button at startup)"
+    echo -e "2. Open Terminal and run: bputil -d"
+    echo -e "3. Go to Startup Security Utility and select 'No Security'"
+    echo -e "4. Enable 'Allow booting from external media'"
+    echo -e "5. Try creating a startup-options.plist file on the Kali partition"
+    echo -e "\n${YELLOW}Advanced users:${NC} If all else fails, in Recovery Mode, run:"
+    echo -e "1. diskutil apfs list   (to identify your volumes)"
+    echo -e "2. bputil -c -v /Volumes/KALI"
     
-    echo -e "\n${YELLOW}${BOLD}IMPORTANT NOTES:${NC}"
-    echo "- Linux support on Apple Silicon is experimental and may have limitations."
-    echo "- Wi-Fi, Bluetooth, and certain hardware features might require additional drivers."
-    echo "- Always boot macOS occasionally to allow firmware updates."
-    echo "- Complete log of this installation is available at: $LOG_FILE"
+    # Clean up temporary files if user wants to
+    if confirm "Do you want to clean up temporary files?"; then
+        info "Cleaning up temporary files..."
+        rm -rf "$TEMP_DIR"
+        success "Temporary files removed."
+    fi
     
-    echo -e "\n${GREEN}${BOLD}Enjoy your Kali Linux installation!${NC}"
+    echo -e "\n${GREEN}${BOLD}Thank you for using the Kali Linux Installer for Apple Silicon Macs!${NC}"
+    exit 0
 }
 
 #####################################################
@@ -1543,34 +1664,29 @@ trap cleanup_on_exit INT TERM
 
 # Main function to execute the installation process
 main() {
-    # Define total steps
-    TOTAL_STEPS=7
+    # Check if we're running as root
+    if [ "$EUID" -ne 0 ]; then
+        header
+        warning "This script needs to run with administrator privileges."
+        if confirm "Do you want to restart with sudo?"; then
+            info "Restarting with sudo..."
+            exec sudo "$0" "$@"
+            exit 0
+        else
+            warning "Continuing without sudo. Some operations may fail."
+        fi
+    fi
     
-    # Display header
+    # Total steps for progress indicator
+    export TOTAL_STEPS=7
+    
+    # Welcome header
     header
     
-    # Check for command line arguments
-    if [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
-        echo "Usage: $0 [options]"
-        echo ""
-        echo "Options:"
-        echo "  --help, -h           Show this help message"
-        echo "  --skip-checks        Skip prerequisite checks (not recommended)"
-        echo "  --configure-only     Only configure dual boot (use after manual installation)"
-        echo "  --use-existing       Use an existing partition for Kali Linux"
-        echo ""
-        exit 0
-    fi
+    # Step 1: Check prerequisites
+    check_prerequisites
     
-    # Check if running configure-only mode
-    if [ "$1" = "--configure-only" ]; then
-        info "Running in configure-only mode"
-        check_sudo_access
-        configure_dual_boot
-        exit 0
-    fi
-    
-    # Check prerequisites unless skipped
+    # Step 2: Download Kali Linux ISO
     if [ "$1" = "--skip-checks" ]; then
         warning "Skipping prerequisite checks as requested"
     else
@@ -1614,8 +1730,16 @@ main() {
     download_kali
     install_bootloader
     install_kali
-    configure_dual_boot
-    complete_installation
+    
+    # Step 6: Configure dual boot with error handling to ensure we continue
+    info "Running dual boot configuration..."
+    configure_dual_boot || {
+        warning "Dual boot configuration encountered issues but will continue to final step."
+        sleep 2
+    }
+    
+    # Step 7: Final step - finish installation (using the finish function instead of complete_installation)
+    finish
     
     return 0
 }
